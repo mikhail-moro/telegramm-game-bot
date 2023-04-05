@@ -1,8 +1,8 @@
 import time
 import datetime
-
 import telebot
 
+from database.database_util import *
 from enum import IntEnum, StrEnum
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from game.game import Game, TurnResult, GameResultCode, TurnResultCode
@@ -59,8 +59,9 @@ class BotClient:
         # ботом или если это новый пользователь
         @self.bot.message_handler(
             func=lambda message:
-                message.from_user.id not in self._chats_statuses.keys()
-                or self._chats_statuses[message.from_user.id] == _Status.IS_NOW_CHAT
+                (message.from_user.id not in self._chats_statuses.keys())
+                or
+                (self._chats_statuses[message.from_user.id] == _Status.IS_NOW_CHAT)
         )
         def chat_message_handler(message: Message):
             player_id = message.from_user.id
@@ -80,8 +81,7 @@ class BotClient:
 
         # Обрабатывает сообщение если отправивший его пользователь должен ввести токен подключения к существующей сессии
         @self.bot.message_handler(
-            func=lambda message:
-                self._chats_statuses[message.from_user.id] == _Status.IS_NOW_AWAITING_TOKEN
+            func=lambda message: self._chats_statuses[message.from_user.id] == _Status.IS_NOW_AWAITING_TOKEN
         )
         def token_message_handler(message):
             player_id = message.from_user.id
@@ -115,6 +115,7 @@ class BotClient:
                         log(f"Сессия {token}. Игроки - 2")
                 else:
                     self.bot.reply_to(message, "Не найдена сессия")
+                    self._chats_statuses[player_id] = _Status.IS_NOW_CHAT
             else:
                 self._chats_statuses[player_id] = _Status.IS_NOW_CHAT
 

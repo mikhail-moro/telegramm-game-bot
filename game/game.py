@@ -18,10 +18,9 @@ class GameResultCode(IntEnum):
 @dataclasses.dataclass
 class Player:
     """
-    Данные об игроке:\n
-    sign: str - символ за который играет игрок (X или O)\n
+    Данные об игроке:
+    sign: str - символ за который играет игрок (X или O)
     id: int - id игрока
-    :param sign:
     """
     sign: str
     id: int
@@ -30,10 +29,10 @@ class Player:
 @dataclasses.dataclass
 class TurnResult:
     """
-    Данные о ходе:\n
-    is_turn_success: bool - успешен ли ход\n
-    game_code: GameResultCode - код сообщения о состоянии игры\n
-    turn_result_code: TurnResultCode - код сообщения о результате хода\n
+    Данные о ходе:
+    is_turn_success: bool - успешен ли ход
+    game_code: GameResultCode - код сообщения о состоянии игры
+    turn_result_code: TurnResultCode - код сообщения о результате хода
     matrix: [[str]] - двумерный список из строк показывающий текущее состояние игры
     """
     is_turn_success: bool
