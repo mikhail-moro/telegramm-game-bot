@@ -1,16 +1,12 @@
+import threading
 import time
 import datetime
 import telebot
 
-from database.database_util import *
+from database import database_utils
 from enum import IntEnum, StrEnum
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from game.game import Game, TurnResult, GameResultCode, TurnResultCode
-
-
-def log(message: str):
-    date = datetime.datetime.today()
-    print(f"{str(date)}: {message}")
 
 
 class _Status(IntEnum):
@@ -27,48 +23,124 @@ class _CallData(StrEnum):
     TURN = "turn"
 
 
+def _log(message: str):
+    date = datetime.datetime.today()
+    print(f"{str(date)}: {message}")
+
+
+def _check_players(timestamps: {int, int}, statuses: {int, _Status}, games: [Game], reset_time: int):
+    while True:
+        time.sleep(reset_time)
+
+        if len(timestamps) > 0 and len(statuses) > 0:
+            time_five_minute_ago = time.time() - reset_time
+
+            for key, value in list(timestamps.items()):
+                if time_five_minute_ago > value:
+                    for i in range(len(games)):
+                        if games[i].is_player_in_game(key):
+                            del games[i]
+
+                    del timestamps[key], statuses[key]
+                    _log(f"Пользователь {key} удалён из оперативной памяти")
+
+
 class BotClient:
-    def __init__(self, bot_token):
+    def __init__(self, bot_token: str, reset_time: int = 300):
         """
         :param bot_token: уникальный токен Telegram-бота
         """
 
-        self._chats_statuses: {int, _Status} = {}
+        self._chats_statuses = {}
         """
-        _chats_statuses: {player_id, status}
-        
+        _chats_statuses: {player_id: int, status: _Status}
         Словарь содержащий в себе статусы всех пользователей
-
+        
         player_id:
             id игрока
         status:
-            _Status.IS_NOW_CHAT - еще не идёт игра или поиск сессии \n
-            _Status.IS_NOW_AWAITING_TOKEN - ожидается ввод токена для присоеденения к существующей сессии \n
+            _Status.IS_NOW_CHAT - еще не идёт игра или поиск сессии
+            _Status.IS_NOW_AWAITING_TOKEN - ожидается ввод токена для присоеденения к существующей сессии
             _Status.IS_NOW_GAME - в данный момент идёт игра
         """
-        self._games: [Game] = []
-        """ 
+
+        self._timestamps = {}
+        """
+        _timestamps: {player_id: int, timestamp: int}
+        Словарь содержащий в себе время последней активности каждого пользователя
+
+        player_id:
+            id игрока
+        timestamp:
+            время в секундах
+        """
+
+        self._games = []
+        """
+        _games: {game: Game}
         Список всех игр идущих на данный момент
         """
+
         self.bot = telebot.TeleBot(bot_token, parse_mode=None)
         """
         Текущий экземпляр класса TeleBot содержащий API для управления Telegram-ботом
         """
 
+        # Запускает новый поток который ассинхронно каждые несколько секунд проверяет пользователей (период задается в
+        # файле run.bat)
+        #
+        # Удаляет данные о пользователе из оперативной памяти, если пользователь не делал никаких действий больше чем
+        # заданный период времени (это необходимо чтоб уменьшить расходы оперативной памяти, но не использовать запросы
+        # к БД слишком часто)
+        update_users_thread = threading.Thread(
+            target=_check_players,
+            args=(self._timestamps, self._chats_statuses, self._games, reset_time)
+        )
+        update_users_thread.start()
+
+        # Изменяет время последней активности пользователя. Если пользователь не загружен из БД - загружает, если
+        # это новый пользователь - также добавляет его в БД
+        #
+        # Загрузка данных пользователя из БД делается для того чтобы, не приходилось каждый раз при смене статуса
+        # пользователя открывать соединение с БД и изменять или загружать данные, а работать с данными в оперативной
+        # памяти
+        def update_timestamp(player_id: int):
+            if player_id in self._chats_statuses.keys() and player_id in self._timestamps.keys():
+                self._timestamps[player_id] = time.time()
+            else:
+                is_user_in_bd_query = database_utils.is_user_in_bd(player_id)
+
+                if is_user_in_bd_query.success:
+                    if is_user_in_bd_query.data:
+                        self._chats_statuses[player_id] = _Status.IS_NOW_CHAT
+                    else:
+                        user_append_query = database_utils.append_user(player_id)
+
+                        if user_append_query.success:
+                            self._chats_statuses[player_id] = _Status.IS_NOW_CHAT
+                            _log(f"Новый пользователь {player_id}")
+                        else:
+                            self.bot.send_message(player_id, text="Ошибка")
+
+                    self._timestamps[player_id] = time.time()
+                    _log(f"Пользователь {player_id} загружен из БД")
+                else:
+                    self.bot.send_message(player_id, text="Ошибка")
+
         # Обрабатывает сообщение если отправивший его пользователь не начал поиск сессии или игру и просто общается с
         # ботом или если это новый пользователь
         @self.bot.message_handler(
             func=lambda message:
-                (message.from_user.id not in self._chats_statuses.keys())
-                or
-                (self._chats_statuses[message.from_user.id] == _Status.IS_NOW_CHAT)
+            message.text[0] != '/' and
+            (
+                    message.from_user.id not in self._chats_statuses.keys()
+                    or
+                    self._chats_statuses[message.from_user.id] == _Status.IS_NOW_CHAT
+            )
         )
         def chat_message_handler(message: Message):
             player_id = message.from_user.id
-
-            if player_id not in self._chats_statuses.keys():
-                self._chats_statuses[player_id] = _Status.IS_NOW_CHAT
-                log(f"Новый пользователь {player_id}")
+            update_timestamp(player_id)
 
             start_button = InlineKeyboardButton("СТАРТ", callback_data=_CallData.START)
             join_button = InlineKeyboardButton("ПРИСОЕДИНИТЬСЯ", callback_data=_CallData.JOIN)
@@ -81,11 +153,14 @@ class BotClient:
 
         # Обрабатывает сообщение если отправивший его пользователь должен ввести токен подключения к существующей сессии
         @self.bot.message_handler(
-            func=lambda message: self._chats_statuses[message.from_user.id] == _Status.IS_NOW_AWAITING_TOKEN
+            func=lambda message:
+            message.text[0] != '/' and
+            self._chats_statuses[message.from_user.id] == _Status.IS_NOW_AWAITING_TOKEN,
         )
         def token_message_handler(message):
             player_id = message.from_user.id
             token = message.text
+            update_timestamp(player_id)
 
             if message.text != 'нет':
                 game = self.__find_game_by_session_token(token)
@@ -112,12 +187,22 @@ class BotClient:
                         self._chats_statuses[turn_player_id] = _Status.IS_NOW_GAME
                         self._chats_statuses[wait_player_id] = _Status.IS_NOW_GAME
 
-                        log(f"Сессия {token}. Игроки - 2")
+                        _log(f"Сессия {token}. Игроки - 2")
                 else:
                     self.bot.reply_to(message, "Не найдена сессия")
                     self._chats_statuses[player_id] = _Status.IS_NOW_CHAT
             else:
                 self._chats_statuses[player_id] = _Status.IS_NOW_CHAT
+
+        # Обрабатывает сообщение если отправивший его пользователь сейчас в игре
+        @self.bot.message_handler(
+            func=lambda message:
+            message.text[0] != '/' and
+            self._chats_statuses[message.from_user.id] == _Status.IS_NOW_GAME,
+        )
+        def chat_message_handler_while_game(message):
+            player_id = message.from_user.id
+            update_timestamp(player_id)
 
         # В следующих обработчиках проверяется лишь первый элемент callback_data так как он содержит информацию об
         # нажатой кнопке, остальные элементы будут содержать координаты хода игрока
@@ -127,14 +212,13 @@ class BotClient:
         def start_session_callback(call):
             player_id = call.from_user.id
 
-            if player_id not in self._chats_statuses.keys():
-                self._chats_statuses[player_id] = _Status.IS_NOW_CHAT
+            update_timestamp(player_id)
 
             if self._chats_statuses[player_id] == _Status.IS_NOW_CHAT:
                 token = self.__create_new_game(player_id)
                 self.bot.send_message(player_id, text=f"Токен вашей сессии: {token}")
-                log(f"Начата новая сессия {token}")
-                log(f"Сессия {token}. Игроки - 1")
+                _log(f"Начата новая сессия {token}")
+                _log(f"Сессия {token}. Игроки - 1")
             else:
                 self.bot.send_message(player_id, text="Вы не можете сейчас начать новую сессию")
 
@@ -143,8 +227,7 @@ class BotClient:
         def join_session_callback(call):
             player_id = call.from_user.id
 
-            if player_id not in self._chats_statuses.keys():
-                self._chats_statuses[player_id] = _Status.IS_NOW_CHAT
+            update_timestamp(player_id)
 
             if self._chats_statuses[player_id] == _Status.IS_NOW_CHAT:
                 self.bot.send_message(player_id, text="Введите токен сессии к которой хотите присоедениться или 'нет' "
@@ -157,6 +240,8 @@ class BotClient:
         @self.bot.callback_query_handler(func=lambda call: call.data.split(' ')[0] == _CallData.TURN)
         def game_turn_callback(call):
             player_id = call.from_user.id
+
+            update_timestamp(player_id)
 
             if self._chats_statuses[player_id] == _Status.IS_NOW_GAME:
                 game: Game = self.__find_game_by_player_id(player_id)
@@ -185,6 +270,16 @@ class BotClient:
                                 self.bot.send_message(turn_player_id, f"Ничья:\n{message_matrix}")
                                 self.bot.send_message(wait_player_id, f"Ничья:\n{message_matrix}")
 
+                                turn_player_query = database_utils.increment_draws(turn_player_id)
+                                wait_player_query = database_utils.increment_draws(wait_player_id)
+
+                                if turn_player_query.success and wait_player_query.success:
+                                    _log(f"Изменены данные пользователя {turn_player_id} в БД ")
+                                    _log(f"Изменены данные пользователя {wait_player_id} в БД ")
+                                else:
+                                    self.bot.send_message(turn_player_id, "Ошибка. Данные не сохраненны")
+                                    self.bot.send_message(wait_player_id, "Ошибка. Данные не сохраненны")
+
                                 self.__end_game(game)
 
                             case GameResultCode.PLAYER_WIN:
@@ -193,6 +288,16 @@ class BotClient:
 
                                 self.bot.send_message(wait_player_id, f"Ход другого игрока:\n{message_matrix}")
                                 self.bot.send_message(wait_player_id, "Вы проиграли")
+
+                                turn_player_query = database_utils.increment_wins(turn_player_id)
+                                wait_player_query = database_utils.increment_loses(wait_player_id)
+
+                                if turn_player_query.success and wait_player_query.success:
+                                    _log(f"Изменены данные пользователя {turn_player_id} в БД ")
+                                    _log(f"Изменены данные пользователя {wait_player_id} в БД ")
+                                else:
+                                    self.bot.send_message(turn_player_id, "Ошибка. Данные не сохраненны")
+                                    self.bot.send_message(wait_player_id, "Ошибка. Данные не сохраненны")
 
                                 self.__end_game(game)
                     else:
@@ -206,10 +311,84 @@ class BotClient:
                 else:
                     self.bot.send_message(wait_player_id, "Ожидайте ваш ход")
 
+        @self.bot.message_handler(commands=["leaders"])
+        def command_leaders_message_handler(message):
+            player_id = message.from_user.id
+            get_leaders_query = database_utils.get_leaders()
+
+            if get_leaders_query.success:
+                data = get_leaders_query.data
+                out_str = ""
+
+                if len(data) > 0 and data is not None:
+                    out_str += "Вот результаты лучших игроков\n\n"
+                    place = 1
+
+                    for i in data:
+                        win_rate = 'недостаточно данных' if i[1] is None else f"{round(i[1], 1)}%"
+                        out_str += f"{place}. {i[0]} - {win_rate}\n"
+                        place += 1
+                else:
+                    out_str = "Нет данных о лучших игроках"
+
+                self.bot.send_message(player_id, text=out_str)
+            else:
+                self.bot.send_message(player_id, text="Ошибка")
+
+        @self.bot.message_handler(commands=["score"])
+        def command_score_message_handler(message):
+            player_id = message.from_user.id
+            get_score_query = database_utils.get_user_score(player_id)
+
+            if get_score_query.success:
+                if get_score_query.data is not None:
+                    data = get_score_query.data
+
+                    wins = data[0]
+                    loses = data[1]
+                    draws = data[2]
+                    win_rate = "недостаточно данных" if data[3] is None else f"{round(data[3], 1)}%"
+                    nick = "нет" if data[4] is None else data[4]
+
+                    name = player_id if data[4] is None else data[4]
+
+                    out_str = \
+                        f"""Вот результаты игрока {name}:
+                            
+                        Винрейт - {win_rate}
+
+                        Победы - {wins}
+                        Поражения - {loses}
+                        Ничьи - {draws}
+                                                        
+                        id: {player_id}
+                        Никнейм: {nick}
+                        """
+                else:
+                    out_str = "Нет данных об игроке"
+
+                self.bot.send_message(player_id, text=out_str)
+            else:
+                self.bot.send_message(player_id, text="Ошибка")
+
+        @self.bot.message_handler(commands=["nick"])
+        def command_nick_message_handler(message):
+            player_id = message.from_user.id
+
+            if len(message.text.split(' ')) == 2:
+                nick = message.text.split(' ')[1]
+                set_nick_query = database_utils.set_nickname(player_id, nick)
+
+                if set_nick_query.success:
+                    self.bot.send_message(player_id, text=f"Теперь вас зовут {nick}")
+                else:
+                    self.bot.send_message(player_id, text="Ошибка")
+            else:
+                self.bot.send_message(player_id, text="Ошибка ввода")
+
     def __create_new_game(self, player_id: int) -> str:
         """
         Создает новую игру с одним игроком
-
         :param player_id: id игрока
         :return: Токен сессии
         """
@@ -227,7 +406,6 @@ class BotClient:
     def __join_to_game(game: Game, player_id: int) -> bool:
         """
         Присоединяет игрока к существующей игре
-
         :param player_id: id игрока
         :return: True - если попытка присоединения прошла удачно
         """
@@ -258,7 +436,6 @@ class BotClient:
     def __matrix_to_markup(matrix: [[str]]) -> InlineKeyboardMarkup:
         """
         Преобразование 3х3 матрицы из строк в интерактивную клавиатуру
-
         :param matrix: двумерный список из строк показывающий текущее состояние игры
         :returns: Экземпляр класса InlineKeyBoardMarkup используемый для создания интерактивной клавиатуры в сообщении
         """
@@ -286,7 +463,6 @@ class BotClient:
     def __matrix_to_emojis(matrix: [[str]]) -> str:
         """
         Преобразование 3х3 матрицы из строк в строку сообщения
-
         :param matrix: двумерный список из строк показывающий текущее состояние игры
         """
 
@@ -311,7 +487,6 @@ class BotClient:
     def __find_game_by_player_id(self, player_id: int) -> Game:
         """
         Поиск игры по id участника
-
         :param player_id: id игрока
         :return: None - если игра не найдена, экземпляр класса Game - если игра найдена
         """
@@ -328,7 +503,6 @@ class BotClient:
     def __find_game_by_session_token(self, session_token: str) -> Game:
         """
         Поиск игры по токену игровой сессии
-
         :param session_token: токен сессии
         :return: None - если игра не найдена, экземпляр класса Game - если игра найдена
         """
@@ -344,7 +518,6 @@ class BotClient:
     def __end_game(self, game: Game):
         """
         Заканчивает игровую сессию
-
         :param game: игра которую требуется завершить
         """
 
@@ -362,4 +535,5 @@ class BotClient:
         """
         Запуск бота
         """
+        _log("Старт бота")
         self.bot.infinity_polling()

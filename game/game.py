@@ -62,9 +62,12 @@ class Game:
             if self.turn != pl.sign:
                 return pl
 
-    @property
-    def game_matrix(self) -> [[str]]:
-        return self.matrix
+    def is_player_in_game(self, player_id: int) -> bool:
+        for pl in self.players:
+            if pl.id == player_id:
+                return True
+
+        return False
 
     def start_new_session(self, player_id: int, session_token: str):
         self.session_token = session_token
