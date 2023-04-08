@@ -120,8 +120,8 @@ class Game:
                 else:
                     self.turn = "X"
 
-                is_player_win = self.__is_player_win(self.matrix)
-                is_matrix_full = self.__is_matrix_full(self.matrix)
+                is_player_win = self._is_player_win(self.matrix)
+                is_matrix_full = self._is_matrix_full(self.matrix)
 
                 if is_player_win:
                     game_result = GameResultCode.PLAYER_WIN
@@ -137,7 +137,7 @@ class Game:
             return TurnResult(False, GameResultCode.GAME_CONTINUE, TurnResultCode.INCORRECT_TURN, self.matrix)
 
     @staticmethod
-    def __is_player_win(matrix: [[str]]) -> bool:
+    def _is_player_win(matrix: [[str]]) -> bool:
         for sign in ["X", "O"]:
             if matrix[0][0] == sign and matrix[0][1] == sign and matrix[0][2] == sign:
                 return True
@@ -161,7 +161,7 @@ class Game:
         return False
 
     @staticmethod
-    def __is_matrix_full(matrix: [[str]]) -> bool:
+    def _is_matrix_full(matrix: [[str]]) -> bool:
         for row in matrix:
             if " " in row:
                 return False

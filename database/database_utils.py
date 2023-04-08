@@ -1,20 +1,8 @@
 import dataclasses
 import datetime
 
-from enum import IntEnum
 from mysql.connector import connect, Error, MySQLConnection, CMySQLConnection
 from mysql.connector.pooling import PooledMySQLConnection
-
-
-class _Status(IntEnum):
-    """
-    _Status.IS_NOW_CHAT - еще не идёт игра или поиск сессии
-    _Status.IS_NOW_AWAITING_TOKEN - ожидается ввод токена для присоеденения к существующей сессии
-    _Status.IS_NOW_GAME - в данный момент идёт игра
-    """
-    IS_NOW_CHAT = 0
-    IS_NOW_AWAITING_TOKEN = 1
-    IS_NOW_GAME = 2
 
 
 @dataclasses.dataclass
@@ -195,6 +183,14 @@ class DatabaseAPI:
     def is_user_in_bd(self,
                       conn: PooledMySQLConnection | MySQLConnection | CMySQLConnection | None,
                       user_id: int) -> DatabaseOperationResult:
+        """
+        Возвращает данные о наличии пользователя в БД по его id в виде экземпляра класса DatabaseOperationResult где,
+        в случае успеха data это True если пользователь есть в БД и False - если нет, в противном случае - None
+
+        :arg conn: подключение к БД, автоматически заполняется декоратором
+        :arg user_id: id пользователя
+        :return: DatabaseOperationResult(success: bool, data: bool | None)
+        """
         with conn.cursor() as cursor:
             try:
                 cursor.execute(f"SELECT id FROM users WHERE id = {user_id} LIMIT 1")
@@ -252,7 +248,7 @@ class DatabaseAPI:
 
                 cursor.execute(
                     "UPDATE users "
-                    f"SET id={row[0]}, wins={row[1]}, loses={row[2]}, draws={row[3]}, win_rate={row[1] / (row[1] + row[2])}"
+                    f"SET id={row[0]}, wins={row[1]}, loses={row[2]}, draws={row[3]}, win_rate={row[1]/(row[1]+row[2])}"
                     f"WHERE id = {user_id}"
                 )
                 conn.commit()
@@ -284,7 +280,7 @@ class DatabaseAPI:
 
                 cursor.execute(
                     "UPDATE users "
-                    f"SET id={row[0]}, wins={row[1]}, loses={row[2]}, draws={row[3]}, win_rate={row[1] / (row[1] + row[2])}"
+                    f"SET id={row[0]}, wins={row[1]}, loses={row[2]}, draws={row[3]}, win_rate={row[1]/(row[1]+row[2])}"
                     f"WHERE id = {user_id}"
                 )
                 conn.commit()

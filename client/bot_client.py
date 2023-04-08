@@ -339,7 +339,7 @@ class BotClient:
                     place = 1
 
                     for i in data:
-                        win_rate = 'недостаточно данных' if i[1] is None else f"{round(i[1], 1)}%"
+                        win_rate = 'недостаточно данных' if i[1] is None else f"{round(100*i[1], 1)}%"
                         out_str += f"{place}. {i[0]} - {win_rate}\n"
                         place += 1
                 else:
