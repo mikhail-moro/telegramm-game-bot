@@ -78,6 +78,20 @@ class DatabaseAPI:
                             return DatabaseOperationResult(False, None)
 
                 out_func = wrapper
+            case "get_nicknames":
+                def wrapper(self, users_ids: [int]):
+                    with connect(**self.db_connect_kwargs) as connection:
+                        try:
+                            data = func(self, connection, users_ids)
+                            connection.close()
+
+                            return data
+                        except Error as e:
+                            _log(e, func.__name__)
+
+                            return DatabaseOperationResult(False, None)
+
+                out_func = wrapper
             case _:
                 def wrapper(self, user_id: int):
                     with connect(**self.db_connect_kwargs) as connection:
@@ -248,7 +262,7 @@ class DatabaseAPI:
 
                 cursor.execute(
                     "UPDATE users "
-                    f"SET id={row[0]}, wins={row[1]}, loses={row[2]}, draws={row[3]}, win_rate={row[1]/(row[1]+row[2])}"
+                    f"SET id={row[0]}, wins={row[1]}, loses={row[2]}, draws={row[3]}, win_rate={row[1] / (row[1] + row[2])}"
                     f"WHERE id = {user_id}"
                 )
                 conn.commit()
@@ -280,7 +294,7 @@ class DatabaseAPI:
 
                 cursor.execute(
                     "UPDATE users "
-                    f"SET id={row[0]}, wins={row[1]}, loses={row[2]}, draws={row[3]}, win_rate={row[1]/(row[1]+row[2])}"
+                    f"SET id={row[0]}, wins={row[1]}, loses={row[2]}, draws={row[3]}, win_rate={row[1] / (row[1] + row[2])}"
                     f"WHERE id = {user_id}"
                 )
                 conn.commit()
@@ -321,6 +335,41 @@ class DatabaseAPI:
             except Error as e:
                 conn.rollback()
                 _log(e, "increment_draws")
+
+                return DatabaseOperationResult(False, None)
+
+    @_database_operation
+    def get_nicknames(self,
+                      conn: PooledMySQLConnection | MySQLConnection | CMySQLConnection | None,
+                      users_ids: [int]) -> DatabaseOperationResult:
+        """
+        Возвращает ник пользователя в БД по его id в виде экземпляра класса DatabaseOperationResult, где в случае если
+        такой пользователь есть в БД, и запрос был завершен без ошибок, data это массив из строк содержащих ники, иначе
+        - None
+
+        :arg conn: подключение к БД, автоматически заполняется декоратором
+        :arg users_ids: id пользователей
+        :return: DatabaseOperationResult(success: bool, data: [str] | None)
+        """
+
+        ids_string = ""
+
+        for i in users_ids:
+            ids_string += f"{i},"
+
+        ids_string = ids_string[:1]
+
+        with conn.cursor() as cursor:
+            try:
+                cursor.execute(f"SELECT nickname FROM users WHERE id IN ({ids_string})")
+                nickname = cursor.fetchall()
+
+                if len(nickname) != 0:
+                    return DatabaseOperationResult(True, nickname)
+                else:
+                    return DatabaseOperationResult(True, None)
+            except Error as e:
+                _log(e, "get_nicknames")
 
                 return DatabaseOperationResult(False, None)
 

@@ -1,6 +1,10 @@
 import dataclasses
 from enum import IntEnum
 
+import keras
+import numpy as np
+from keras import Sequential
+
 
 class TurnResultCode(IntEnum):
     SUCCESS = 0
@@ -13,6 +17,7 @@ class GameResultCode(IntEnum):
     GAME_CONTINUE = 0
     PLAYER_WIN = 1
     NO_ONE_WIN = 2
+    AI_WIN = 3
 
 
 @dataclasses.dataclass
@@ -166,3 +171,124 @@ class Game:
             if " " in row:
                 return False
         return True
+
+
+class GameAI:
+    def __init__(self, model: Sequential):
+        self.player = None
+        self.matrix = None
+        self.model: Sequential = model
+
+    def start_new_session(self, player_id: int):
+        self.matrix: [[str]] = [[" ", " ", " "],
+                                [" ", " ", " "],
+                                [" ", " ", " "]]
+        self.player: Player = Player('X', player_id)
+
+    def _one_hot(self):
+        field = np.zeros(9, dtype='int')
+
+        for i in range(3):
+            for a in range(3):
+                if self.matrix[i][a] == 'X':
+                    field[i*a] = 1
+                if self.matrix[i][a] == 'O':
+                    field[i*a] = 2
+
+        return np.eye(3)[field][:, [0, 2, 1]].reshape(-1)
+
+    def make_turn(self, row: int, column: int) -> TurnResult:
+        #
+        # Ход человека
+        #
+        if row in [0, 1, 2] and column in [0, 1, 2]:
+            cell = self.matrix[row][column]
+
+            if cell == ' ':
+                self.matrix[row][column] = 'X'
+
+                is_player_win = self._is_player_win()
+                is_matrix_full = self._is_matrix_full()
+
+                if is_player_win or is_matrix_full:
+                    if is_player_win:
+                        return TurnResult(True, GameResultCode.PLAYER_WIN, TurnResultCode.SUCCESS, self.matrix)
+                    else:
+                        return TurnResult(True, GameResultCode.NO_ONE_WIN, TurnResultCode.SUCCESS, self.matrix)
+                else:
+                    #
+                    # Ход AI
+                    #
+                    predicted = self.model.predict([self._one_hot().reshape(1, 1, 27)], verbose=0)
+                    checked_predicted = []
+
+                    for i in range(3):
+                        for a in range(3):
+                            if self.matrix[i][a] == ' ':
+                                checked_predicted.append(predicted[0][i*a])
+                            else:
+                                checked_predicted.append(-100)
+
+                    turn = np.argmax(checked_predicted)
+                    turn = (int(turn / 3), turn % 3)
+
+                    self.matrix[turn[0]][turn[1]] = 'O'
+
+                    if is_player_win or is_matrix_full:
+                        if is_player_win:
+                            return TurnResult(True, GameResultCode.AI_WIN, TurnResultCode.SUCCESS, self.matrix)
+                        else:
+                            return TurnResult(True, GameResultCode.NO_ONE_WIN, TurnResultCode.SUCCESS, self.matrix)
+                    else:
+                        return TurnResult(True, GameResultCode.GAME_CONTINUE, TurnResultCode.SUCCESS, self.matrix)
+            else:
+                return TurnResult(False, GameResultCode.GAME_CONTINUE, TurnResultCode.INCORRECT_TURN, self.matrix)
+        else:
+            return TurnResult(False, GameResultCode.GAME_CONTINUE, TurnResultCode.INCORRECT_TURN, self.matrix)
+
+    def _is_player_win(self) -> bool:
+        for sign in ["X", "O"]:
+            if self.matrix[0][0] == sign and self.matrix[0][1] == sign and self.matrix[0][2] == sign:
+                return True
+            if self.matrix[1][0] == sign and self.matrix[1][1] == sign and self.matrix[1][2] == sign:
+                return True
+            if self.matrix[2][0] == sign and self.matrix[2][1] == sign and self.matrix[2][2] == sign:
+                return True
+
+            if self.matrix[0][0] == sign and self.matrix[1][0] == sign and self.matrix[2][0] == sign:
+                return True
+            if self.matrix[0][1] == sign and self.matrix[1][1] == sign and self.matrix[2][1] == sign:
+                return True
+            if self.matrix[0][2] == sign and self.matrix[1][2] == sign and self.matrix[2][2] == sign:
+                return True
+
+            if self.matrix[0][0] == sign and self.matrix[1][1] == sign and self.matrix[2][2] == sign:
+                return True
+            if self.matrix[0][2] == sign and self.matrix[1][1] == sign and self.matrix[2][0] == sign:
+                return True
+
+        return False
+
+    def _is_matrix_full(self) -> bool:
+        for row in self.matrix:
+            if " " in row:
+                return False
+        return True
+
+    @staticmethod
+    def _to_int(char: str) -> float:
+        match char:
+            case ' ':
+                return 0.0
+            case 'X':
+                return 1/3
+            case 'O':
+                return 2/3
+
+    def _reshape(self) -> [[float]]:
+        out_matrix = []
+
+        for i in self.matrix:
+            out_matrix.append([self._to_int(a) for a in i])
+
+        return out_matrix

@@ -6,21 +6,28 @@ import telebot
 from enum import IntEnum, StrEnum
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from database.database_utils import DatabaseAPI
-from game.game import Game, TurnResult, GameResultCode, TurnResultCode
+from game.game import Game, TurnResult, GameResultCode, TurnResultCode, GameAI
+from keras.models import Sequential
 
 
 class _Status(IntEnum):
     IS_NOW_CHAT = 0
     IS_NOW_AWAITING_TOKEN = 1
     IS_NOW_GAME = 2
+    IS_NOW_AWAITING_PLAYER = 3
+    IS_NOW_AI_GAME = 4
 
 
 # В данном случае используется StrEnum так как параметр callback_data класса InlineKeyboardMarkup требует
 # строчный тип данных входного значения
 class _CallData(StrEnum):
-    START = "start"
-    JOIN = "join"
+    BUTTON_AI = "ai"
+    BUTTON_START = "start"
+    BUTTON_JOIN = "join"
+    SESSION_JOIN = "session"
     TURN = "turn"
+    TURN_AI = "turn_ai"
+    RESET = "reset"
 
 
 def _log(message: str):
@@ -46,7 +53,7 @@ def _check_players(timestamps: {int, int}, statuses: {int, _Status}, games: [Gam
 
 
 class BotClient:
-    def __init__(self, bot_token: str, database_conn_kwargs: {str: str}, reset_time: int):
+    def __init__(self, bot_token: str, database_conn_kwargs: {str: str}, reset_time: int, model: Sequential | None):
         """
         :param bot_token: уникальный токен Telegram-бота
         """
@@ -81,6 +88,12 @@ class BotClient:
         Список всех игр идущих на данный момент
         """
 
+        self._ai_games = []
+        """
+        _ai_games: {ai_game: GameAI}
+        Список всех игр идущих на данный момент
+        """
+
         self.bot = telebot.TeleBot(bot_token, parse_mode=None)
         """
         Текущий экземпляр класса TeleBot содержащий API для управления Telegram-ботом
@@ -89,6 +102,12 @@ class BotClient:
         self.database_api = DatabaseAPI(database_conn_kwargs)
         """
         Текущий экземпляр класса DatabaseAPI содержащий API для запросов к БД
+        """
+
+        self.model: Sequential | None = model
+        """
+        Текущий экземпляр класса Sequential представляющий модель глубокой-сверточной нейронной сети для предсказания
+        самого оптимального хода при игре против AI
         """
 
         # Запускает новый поток который ассинхронно каждые несколько секунд проверяет пользователей (период задается в
@@ -136,12 +155,12 @@ class BotClient:
         # ботом или если это новый пользователь
         @self.bot.message_handler(
             func=lambda message:
-                message.text[0] != '/' and
-                (
+            message.text[0] != '/' and
+            (
                     message.from_user.id not in self._chats_statuses.keys()
                     or
                     self._chats_statuses[message.from_user.id] == _Status.IS_NOW_CHAT
-                )
+            )
         )
         def chat_message_handler(message: Message):
             player_id = message.from_user.id
@@ -150,18 +169,81 @@ class BotClient:
             self.bot.reply_to(message, text="Привет, это бот для игры в крестики-нолики. Введите /start чтобы начать"
                                             "игру")
 
-        # Обрабатывает сообщение если отправивший его пользователь должен ввести токен подключения к существующей сессии
+        # Обрабатывает сообщение если отправивший его пользователь сейчас в игре
         @self.bot.message_handler(
             func=lambda message:
-                message.text[0] != '/' and
-                self._chats_statuses[message.from_user.id] == _Status.IS_NOW_AWAITING_TOKEN
+            message.text[0] != '/' and
+            self._chats_statuses[message.from_user.id] == _Status.IS_NOW_GAME
         )
-        def token_message_handler(message):
+        def chat_message_handler_while_game(message):
             player_id = message.from_user.id
-            token = message.text
             _update_timestamp(player_id)
 
-            if message.text != 'нет':
+        # В следующих обработчиках проверяется лишь первый элемент callback_data так как он содержит информацию об
+        # нажатой кнопке, остальные элементы будут содержать координаты хода игрока
+
+        # Обрабатывает нажатие на кнопку "СТАРТ"
+        @self.bot.callback_query_handler(func=lambda call: call.data.split(' ')[0] == _CallData.BUTTON_START)
+        def button_start_callback(call):
+            player_id = call.from_user.id
+            _update_timestamp(player_id)
+
+            nick_query = self.database_api.get_nickname(player_id)
+            nickname = None
+
+            if nick_query.success:
+                nickname = nick_query.data
+
+            if self._chats_statuses[player_id] == _Status.IS_NOW_CHAT:
+                token = self._create_new_game(player_id)
+                button = InlineKeyboardMarkup()
+                button.add(InlineKeyboardButton(text="Отмена", callback_data=_CallData.RESET))
+
+                if nickname is None:
+                    self.bot.send_message(player_id,
+                                          text=f"Теперь в списке игр будет ваш id: {player_id}. Чтобы установить себе "
+                                               f"никнейм вместо id воспользуйтесь командой /nick 'ваш ник'",
+                                          reply_markup=button
+                                          )
+                else:
+                    self.bot.send_message(player_id,
+                                          text=f"Теперь в списке игр будет ваш ник: {nickname}",
+                                          reply_markup=button
+                                          )
+
+                self._chats_statuses[player_id] = _Status.IS_NOW_AWAITING_PLAYER
+                _log(f"Начата новая сессия {token}")
+                _log(f"Сессия {token}. Игроки - 1")
+            else:
+                self.bot.send_message(player_id, text="Вы не можете сейчас начать новую сессию")
+
+        # Обрабатывает нажатие на кнопку "ПРИСОЕДИНИТЬСЯ"
+        @self.bot.callback_query_handler(func=lambda call: call.data.split(' ')[0] == _CallData.BUTTON_JOIN)
+        def button_join_callback(call):
+            player_id = call.from_user.id
+            _update_timestamp(player_id)
+
+            if self._chats_statuses[player_id] == _Status.IS_NOW_CHAT:
+                non_fulled_games = [i for i in self._games if len(i.players) == 1]
+
+                if len(non_fulled_games) == 0:
+                    self.bot.send_message(player_id, text="Сейчас никто не ищет противников. Попробуйте начать свою "
+                                                          "игру или сыграйте против AI")
+                else:
+                    self.bot.send_message(player_id,
+                                          text="Список всех доступных игр, нажмите чтобы присоединиться:",
+                                          reply_markup=self._games_to_markup()
+                                          )
+            else:
+                self.bot.send_message(player_id, text="Вы не можете сейчас присоедениться к сессии")
+
+        @self.bot.callback_query_handler(func=lambda call: call.data.split(' ')[0] == _CallData.SESSION_JOIN)
+        def session_join_session_callback(call):
+            player_id = call.from_user.id
+            _update_timestamp(player_id)
+
+            if self._chats_statuses[player_id] == _Status.IS_NOW_CHAT:
+                token = call.data.split(' ')[1]
                 game = self._find_game_by_session_token(token)
 
                 if game is not None:
@@ -187,59 +269,63 @@ class BotClient:
                         self._chats_statuses[wait_player_id] = _Status.IS_NOW_GAME
 
                         _log(f"Сессия {token}. Игроки - 2")
+                    else:
+                        self.bot.send_message(player_id, "Не получилось присоедениться к игре")
                 else:
-                    self.bot.reply_to(message, "Не найдена сессия")
-                    self._chats_statuses[player_id] = _Status.IS_NOW_CHAT
+                    self.bot.send_message(player_id, "Не найдена сессия, возможно первый игрок отменил игру, или место "
+                                                     "уже занято")
             else:
-                self._chats_statuses[player_id] = _Status.IS_NOW_CHAT
+                self.bot.send_message(player_id, "Вы не можете сейчас присоедениться к игре")
 
-        # Обрабатывает сообщение если отправивший его пользователь сейчас в игре
-        @self.bot.message_handler(
-            func=lambda message:
-                message.text[0] != '/' and
-                self._chats_statuses[message.from_user.id] == _Status.IS_NOW_GAME
-        )
-        def chat_message_handler_while_game(message):
-            player_id = message.from_user.id
-            _update_timestamp(player_id)
-
-        # В следующих обработчиках проверяется лишь первый элемент callback_data так как он содержит информацию об
-        # нажатой кнопке, остальные элементы будут содержать координаты хода игрока
-
-        # Обрабатывает нажатие на кнопку "СТАРТ"
-        @self.bot.callback_query_handler(func=lambda call: call.data.split(' ')[0] == _CallData.START)
-        def start_session_callback(call):
+        @self.bot.callback_query_handler(func=lambda call: call.data.split(' ')[0] == _CallData.RESET)
+        def reset_callback(call):
             player_id = call.from_user.id
-
             _update_timestamp(player_id)
 
-            if self._chats_statuses[player_id] == _Status.IS_NOW_CHAT:
-                token = self._create_new_game(player_id)
-                self.bot.send_message(player_id, text=f"Токен вашей сессии: {token}")
-                _log(f"Начата новая сессия {token}")
-                _log(f"Сессия {token}. Игроки - 1")
-            else:
-                self.bot.send_message(player_id, text="Вы не можете сейчас начать новую сессию")
+            if self._chats_statuses[player_id] == _Status.IS_NOW_GAME:
+                for i in range(len(self._games)):
+                    game = self._games[i]
+                    awaiting_player_id = game.awaiting_player.id
+                    turn_now_player_id = game.turn_now_player.id
 
-        # Обрабатывает нажатие на кнопку "ПРИСОЕДИНИТЬСЯ"
-        @self.bot.callback_query_handler(func=lambda call: call.data.split(' ')[0] == _CallData.JOIN)
-        def join_session_callback(call):
-            player_id = call.from_user.id
+                    if player_id == awaiting_player_id:
+                        self.bot.send_message(awaiting_player_id, text="Вы сдались")
+                        self.bot.send_message(turn_now_player_id, text="Ваш противник сдался")
+                        self._chats_statuses[turn_now_player_id] = _Status.IS_NOW_CHAT
 
-            _update_timestamp(player_id)
+                    if player_id == turn_now_player_id:
+                        self.bot.send_message(turn_now_player_id, text="Вы сдались")
+                        self.bot.send_message(awaiting_player_id, text="Ваш противник сдался")
+                        self._chats_statuses[awaiting_player_id] = _Status.IS_NOW_CHAT
 
-            if self._chats_statuses[player_id] == _Status.IS_NOW_CHAT:
-                self.bot.send_message(player_id, text="Введите токен сессии к которой хотите присоедениться или 'нет' "
-                                                      "если хотите выйти:")
-                self._chats_statuses[player_id] = _Status.IS_NOW_AWAITING_TOKEN
-            else:
-                self.bot.send_message(player_id, text="Вы не можете сейчас присоедениться к сессии")
+                    if player_id == awaiting_player_id or player_id == turn_now_player_id:
+                        del self._games[i]
+
+            if self._chats_statuses[player_id] == _Status.IS_NOW_AI_GAME:
+                for i in range(len(self._ai_games)):
+                    ai_game = self._ai_games[i]
+
+                    if player_id == ai_game.player.id:
+                        self.bot.send_message(player_id, text="Вы сдались")
+
+                        del self._ai_games[i]
+
+            if self._chats_statuses[player_id] == _Status.IS_NOW_AWAITING_PLAYER:
+                for i in range(len(self._games)):
+                    game = self._games[i]
+                    player = game.players[0]
+
+                    if player_id == player.id:
+                        self.bot.send_message(player_id, text="Отмена игры")
+
+                        del self._games[i]
+
+            self._chats_statuses[player_id] = _Status.IS_NOW_CHAT
 
         # Обрабатывает нажатие на кнопку хода
         @self.bot.callback_query_handler(func=lambda call: call.data.split(' ')[0] == _CallData.TURN)
         def game_turn_callback(call):
             player_id = call.from_user.id
-
             _update_timestamp(player_id)
 
             if self._chats_statuses[player_id] == _Status.IS_NOW_GAME:
@@ -309,17 +395,95 @@ class BotClient:
                                 self.bot.send_message(turn_player_id, "Не найдена сессия")
                 else:
                     self.bot.send_message(wait_player_id, "Ожидайте ваш ход")
+            else:
+                self.bot.send_message(player_id, "Вы не можете сейчас ходить")
+
+        @self.bot.callback_query_handler(func=lambda call: call.data.split(' ')[0] == _CallData.BUTTON_AI)
+        def button_ai_callback(call):
+            player_id = call.from_user.id
+            _update_timestamp(player_id)
+
+            if self._chats_statuses[player_id] == _Status.IS_NOW_CHAT:
+                self._create_new_ai_game(player_id)
+                self._chats_statuses[player_id] = _Status.IS_NOW_AI_GAME
+
+                ai_games = [i for i in self._ai_games if i.player.id == player_id]
+
+                if len(ai_games) > 0:
+                    ai_game = ai_games[0]
+                    matrix = ai_game.matrix
+
+                    markup = self._ai_matrix_to_markup(matrix)
+                    message_matrix = self._matrix_to_emojis(matrix)
+
+                    self.bot.send_message(player_id, "Игра началась, вы играете за \"X\".\nВаш ход:")
+                    self.bot.send_message(player_id, message_matrix, reply_markup=markup)
+
+                    self._chats_statuses[player_id] = _Status.IS_NOW_AI_GAME
+
+                    _log(f"Игрок {player_id} начал сессию против AI")
+                else:
+                    self.bot.send_message(player_id, text="Ошибка начала игры")
+            else:
+                self.bot.send_message(player_id, text="Вы не можете сейчас начать игру")
+
+        @self.bot.callback_query_handler(func=lambda call: call.data.split(' ')[0] == _CallData.TURN_AI)
+        def ai_game_turn_callback(call):
+            player_id = call.from_user.id
+            _update_timestamp(player_id)
+
+            if self._chats_statuses[player_id] == _Status.IS_NOW_AI_GAME:
+                ai_games = [i for i in self._ai_games if i.player.id == player_id]
+
+                if len(ai_games) > 0:
+                    ai_game = ai_games[0]
+                    turn_res = self._ai_game_turn(ai_game, call.data)
+
+                    if turn_res.is_turn_success:
+                        message_matrix = self._matrix_to_emojis(turn_res.matrix)
+
+                        match turn_res.game_result_code:
+                            case GameResultCode.GAME_CONTINUE:
+                                markup = self._ai_matrix_to_markup(turn_res.matrix)
+
+                                self.bot.send_message(player_id, "Теперь ваш ход:")
+                                self.bot.send_message(player_id, message_matrix, reply_markup=markup)
+
+                            case GameResultCode.NO_ONE_WIN:
+                                self.bot.send_message(player_id, f"Ничья:\n{message_matrix}")
+
+                                self._end_ai_game(ai_game)
+
+                            case GameResultCode.PLAYER_WIN:
+                                self.bot.send_message(player_id, f"Результат вашего хода:\n{message_matrix}")
+                                self.bot.send_message(player_id, "Вы выиграли")
+
+                                self._end_ai_game(ai_game)
+                            case GameResultCode.AI_WIN:
+                                self.bot.send_message(player_id, f"Результат хода бота:\n{message_matrix}")
+                                self.bot.send_message(player_id, "Вы прогирали")
+
+                                self._end_ai_game(ai_game)
+                    else:
+                        if turn_res.turn_result_code == TurnResultCode.INCORRECT_TURN:
+                            self.bot.send_message(player_id, "Неправильный ход")
+                else:
+                    self.bot.send_message(player_id, "Ошибка хода")
+            else:
+                self.bot.send_message(player_id, "Вы не можете сейчас ходить")
 
         @self.bot.message_handler(commands=["start"])
         def command_leaders_message_handler(message):
             player_id = message.from_user.id
             _update_timestamp(player_id)
 
-            start_button = InlineKeyboardButton("СТАРТ", callback_data=_CallData.START)
-            join_button = InlineKeyboardButton("ПРИСОЕДИНИТЬСЯ", callback_data=_CallData.JOIN)
+            markup = InlineKeyboardMarkup(row_width=1)
 
-            markup = InlineKeyboardMarkup(row_width=2)
-            markup.add(start_button, join_button)
+            if self.model is not None:
+                markup.row(InlineKeyboardButton("ИГРА С БОТОМ", callback_data=_CallData.BUTTON_AI))
+
+            markup.row(InlineKeyboardButton("СТАРТ", callback_data=_CallData.BUTTON_START))
+            markup.row(InlineKeyboardButton("ПРИСОЕДИНИТЬСЯ", callback_data=_CallData.BUTTON_JOIN))
 
             self.bot.reply_to(message, text="Нажмите СТАРТ чтобы начать новую игру, или ПРИСОЕДИНИТЬСЯ чтобы "
                                             "присоединиться к существующей", reply_markup=markup)
@@ -339,7 +503,7 @@ class BotClient:
                     place = 1
 
                     for i in data:
-                        win_rate = 'недостаточно данных' if i[1] is None else f"{round(100*i[1], 1)}%"
+                        win_rate = 'недостаточно данных' if i[1] is None else f"{round(100 * i[1], 1)}%"
                         out_str += f"{place}. {i[0]} - {win_rate}\n"
                         place += 1
                 else:
@@ -403,6 +567,18 @@ class BotClient:
                 self.bot.send_message(player_id, text="Ошибка ввода. Введите данные в формате - \"/nick никнейм\". "
                                                       "Никнейм не должен содержать пробелы.")
 
+    def _create_new_ai_game(self, player_id: int):
+        """
+        Создает новую игру с одним игроком
+        :param player_id: id игрока
+        :return: Токен сессии
+        """
+
+        ai_game = GameAI(model=self.model)
+        ai_game.start_new_session(player_id)
+
+        self._ai_games.append(ai_game)
+
     def _create_new_game(self, player_id: int) -> str:
         """
         Создает новую игру с одним игроком
@@ -436,6 +612,19 @@ class BotClient:
             return False
 
     @staticmethod
+    def _ai_game_turn(ai_game: GameAI, raw_turn: str) -> TurnResult:
+        """
+        :param ai_game: игра в которой будет сделан ход
+        :param raw_turn: строка с информацией о ходе
+        :return: Экземпляр класса TurnResult с информацией о результате хода
+        """
+
+        turn = [int(i) for i in raw_turn.split(' ')[1:]]
+        turn_data = ai_game.make_turn(turn[0], turn[1])
+
+        return turn_data
+
+    @staticmethod
     def _game_turn(game: Game, player_id: int, raw_turn: str) -> TurnResult:
         """
         :param game: игра в которой будет сделан ход
@@ -448,6 +637,61 @@ class BotClient:
         turn_data = game.make_turn(player_id, turn[0], turn[1])
 
         return turn_data
+
+    def _games_to_markup(self) -> InlineKeyboardMarkup:
+        not_fulled_games = [i for i in self._games if len(i.players) == 1]
+        awaiting_players_ids = [i.players[0].id for i in not_fulled_games]
+        awaiting_players_data = self.database_api.get_nicknames(awaiting_players_ids).data
+
+        awaiting_players_tokens = [i.session_token for i in not_fulled_games]
+        awaiting_players_names = []
+
+        for player_id, player_data in zip(awaiting_players_ids, awaiting_players_data):
+            if player_data is None:
+                awaiting_players_names.append(str(player_id))
+            else:
+                awaiting_players_names.append(player_data)
+
+        markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+
+        for i in range(len(not_fulled_games)):
+            cell = InlineKeyboardButton(
+                text=f"Присоеденится к {awaiting_players_names[i]}",
+                callback_data=f"{_CallData.SESSION_JOIN} {awaiting_players_tokens[i]}"
+            )
+
+            markup.row(cell)
+
+        return markup
+
+    @staticmethod
+    def _ai_matrix_to_markup(matrix: [[str]]) -> InlineKeyboardMarkup:
+        """
+        Преобразование 3х3 матрицы из строк в интерактивную клавиатуру
+        :param matrix: двумерный список из строк показывающий текущее состояние игры
+        :returns: Экземпляр класса InlineKeyBoardMarkup используемый для создания интерактивной клавиатуры в сообщении
+        """
+
+        markup = telebot.types.InlineKeyboardMarkup(row_width=3)
+
+        cell_1_1 = InlineKeyboardButton(matrix[0][0], callback_data=f'{_CallData.TURN_AI} 0 0')
+        cell_1_2 = InlineKeyboardButton(matrix[0][1], callback_data=f'{_CallData.TURN_AI} 0 1')
+        cell_1_3 = InlineKeyboardButton(matrix[0][2], callback_data=f'{_CallData.TURN_AI} 0 2')
+        markup.row(cell_1_1, cell_1_2, cell_1_3)
+
+        cell_2_1 = InlineKeyboardButton(matrix[1][0], callback_data=f'{_CallData.TURN_AI} 1 0')
+        cell_2_2 = InlineKeyboardButton(matrix[1][1], callback_data=f'{_CallData.TURN_AI} 1 1')
+        cell_2_3 = InlineKeyboardButton(matrix[1][2], callback_data=f'{_CallData.TURN_AI} 1 2')
+        markup.row(cell_2_1, cell_2_2, cell_2_3)
+
+        cell_3_1 = InlineKeyboardButton(matrix[2][0], callback_data=f'{_CallData.TURN_AI} 2 0')
+        cell_3_2 = InlineKeyboardButton(matrix[2][1], callback_data=f'{_CallData.TURN_AI} 2 1')
+        cell_3_3 = InlineKeyboardButton(matrix[2][2], callback_data=f'{_CallData.TURN_AI} 2 2')
+        markup.row(cell_3_1, cell_3_2, cell_3_3)
+
+        markup.row(InlineKeyboardButton(text="Отмена", callback_data=_CallData.RESET))
+
+        return markup
 
     @staticmethod
     def _matrix_to_markup(matrix: [[str]]) -> InlineKeyboardMarkup:
@@ -473,6 +717,8 @@ class BotClient:
         cell_3_2 = InlineKeyboardButton(matrix[2][1], callback_data=f'{_CallData.TURN} 2 1')
         cell_3_3 = InlineKeyboardButton(matrix[2][2], callback_data=f'{_CallData.TURN} 2 2')
         markup.row(cell_3_1, cell_3_2, cell_3_3)
+
+        markup.row(InlineKeyboardButton(text="Отмена", callback_data=_CallData.RESET))
 
         return markup
 
@@ -527,10 +773,23 @@ class BotClient:
         game = None
 
         for g in self._games:
-            if session_token == g.session_token:
+            if session_token == g.session_token and len(g.players) == 1:
                 game = g
 
         return game
+
+    def _end_ai_game(self, ai_game: GameAI):
+        """
+        Заканчивает игровую сессию
+        :param ai_game: игра которую требуется завершить
+        """
+
+        player = ai_game.player
+        self._chats_statuses[player.id] = _Status.IS_NOW_CHAT
+
+        for i in range(len(self._ai_games)):
+            if self._ai_games[i].player.id == player.id:
+                del self._ai_games[i]
 
     def _end_game(self, game: Game):
         """
