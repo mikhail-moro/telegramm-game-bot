@@ -56,6 +56,9 @@ class BotClient:
     def __init__(self, bot_token: str, database_conn_kwargs: {str: str}, reset_time: int, model: Sequential | None):
         """
         :param bot_token: уникальный токен Telegram-бота
+        :param database_conn_kwargs: словарь с аргументами для соединения с БД
+        :param reset_time: время после которого пользователь будет удален из оперативной памяти (не из БД)
+        :param model: модель для игры против AI, или None - если не подразумевается режим против бота
         """
 
         self._chats_statuses = {}
@@ -106,7 +109,7 @@ class BotClient:
 
         self.model: Sequential | None = model
         """
-        Текущий экземпляр класса Sequential представляющий модель глубокой-сверточной нейронной сети для предсказания
+        Текущий экземпляр класса Sequential представляющий модель глубокой нейронной сети для предсказания 
         самого оптимального хода при игре против AI
         """
 
@@ -331,9 +334,8 @@ class BotClient:
             if self._chats_statuses[player_id] == _Status.IS_NOW_GAME:
                 game: Game = self._find_game_by_player_id(player_id)
 
-                # После каждого хода экземпляр класса Game самостоятельно меняет роли игроков
-                turn_player_id = game.turn_now_player.id
-                wait_player_id = game.awaiting_player.id
+                turn_player_id = player_id
+                wait_player_id = [pl for pl in game.players if pl.id != player_id][0]
 
                 if player_id == turn_player_id:
                     turn_res = self._game_turn(game, player_id, call.data)
